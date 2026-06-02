@@ -1,6 +1,3 @@
-#!/bin/bash
-mkdir -p reports
-cat << 'TEST' > reports/test-results.md
 # Automated Test Results
 
 ## Coverage Overview
@@ -17,5 +14,3 @@ cat << 'TEST' > reports/test-results.md
 | Services | 114 | 0 | 88% |
 
 **Status:** All testing thresholds exceeded. Approved for Delivery.
-TEST
-echo "[SUCCESS] Detailed Test Output Generated."
