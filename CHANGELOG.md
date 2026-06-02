@@ -1,5 +1,12 @@
 # Changelog — Super Pi
 
+## [v15.0.2] 2026-06-02 ARCHON FORMAL VERIFICATION FIXES
+- [TN-01] CRITICAL: TranscendenceNexus — permissionless auto-path via IASIVerifier (Condition[3] on-chain); 48h timelock + 3-of-5 multi-sig governance override; $SPI peg guard on declaration
+- [AZ-01] CRITICAL: AbsoluteZeroRiskEngine — real Groth16 verifier (IGroth16Verifier) replaces bytes32-only proof; granular coverage-weighted riskScore (0-10000)
+- [OC-01] CRITICAL: OmegaConsciousness — monotonicity highWaterMark enforced; state can never regress; $SPI peg guard on evolution
+- [MB-01] CRITICAL: MetaverseEconomyBridge — explicit bridgeOut() implemented; deposit accounting per user/zone; feeCollector 48h timelock
+- [QE-HIGH] QuantumEntanglementLedger — deterministic pairId (no collision), PAIR_EXPIRY_BLOCKS, $SPI peg guard
+
 ## [v15.0.1] 2026-06-02 SECURITY PATCH — SAPIENS Audit Response
 - ExistentialRiskEngine v1.1: 8 circuit-breaker bypass vectors patched (immutable threshold,
   oracle rate-limit, CEI pattern, MIN_RISK_DELTA, block.number cooldown)

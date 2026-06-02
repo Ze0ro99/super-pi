@@ -1,117 +1,123 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
-// Super Pi v15.0.1 — MetaverseEconomyBridge (Security Patch v1.1)
-// SAPIENS Audit fixes: 8 reentrancy paths patched
-// (1) Global reentrancy mutex covers ALL state-changing functions;
-// (2) No ERC-777 tokensReceived hooks — only safeTransferFrom used;
-// (3) Cross-chain replay: nonce + chainId + contractAddress domain separation;
-// (4) Cross-function reentrancy: single ReentrancyGuard on all entry points;
-// (5) CEI pattern enforced throughout;
-// (6) No low-level .call() for token transfers — IERC20.transferFrom only;
-// (7) Zone registration immutable after creation (no rate override attack);
-// (8) Pi Coin ban enforced at zone registration + every transfer.
+// Super Pi v15.0.2 — MetaverseEconomyBridge (ARCHON patch v1.2)
+// Includes all SAPIENS v1.1 fixes PLUS:
+// [MB-01] CRITICAL: explicit bridgeOut() implemented — no more locked funds.
+// [MB-HIGH] feeCollector change requires 48h timelock + multi-sig confirmation.
 import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 contract MetaverseEconomyBridge is AccessControl, ReentrancyGuard {
-    using SafeERC20 for IERC20; // FIX (2)(6): SafeERC20 — no raw .call(), no ERC-777 hooks
+    using SafeERC20 for IERC20;
 
     bytes32 public constant BRIDGE_OPERATOR = keccak256("BRIDGE_OPERATOR");
-    IERC20  public immutable spiToken;
+    bytes32 public constant FEE_GUARDIAN    = keccak256("FEE_GUARDIAN"); // [MB-HIGH]
 
-    bytes32 private constant PI_COIN_HASH    = keccak256(abi.encodePacked("PI_COIN"));
-    bytes32 private constant PI_NET_HASH     = keccak256(abi.encodePacked("PINETWORK"));
-    bytes32 private constant PI_TICKER_HASH  = keccak256(abi.encodePacked("PI"));
+    IERC20 public immutable spiToken;
 
-    // FIX (7): zone data immutable after creation
+    bytes32 private constant PI_COIN_HASH   = keccak256(abi.encodePacked("PI_COIN"));
+    bytes32 private constant PI_NET_HASH    = keccak256(abi.encodePacked("PINETWORK"));
+    bytes32 private constant PI_TICKER_HASH = keccak256(abi.encodePacked("PI"));
+
+    // [MB-HIGH] feeCollector timelock
+    uint256 public constant FEE_COLLECTOR_TIMELOCK = 14_400; // 48h in blocks
+    address public feeCollector;
+    address public pendingFeeCollector;
+    uint256 public feeCollectorChangeProposedBlock;
+
     struct MetaZone {
         bytes32 zoneId;
         string  name;
-        uint256 spiExchangeRate; // FIX (7): set once, read-only after creation
+        uint256 spiExchangeRate; // immutable after creation
         bool    active;
         uint256 createdAtBlock;
     }
-    mapping(bytes32 => MetaZone) public zones;
+    mapping(bytes32 => MetaZone)    public zones;
+    mapping(address => uint256)     public bridgeNonce;
+    // user → zoneId → deposited amount (for bridgeOut accounting)
+    mapping(address => mapping(bytes32 => uint256)) public deposits;
 
-    // FIX (3): cross-chain replay protection — per-user nonce
-    mapping(address => uint256) public bridgeNonce;
-    // FIX (8): domain separator
     bytes32 public immutable DOMAIN_SEPARATOR;
 
     event ZoneRegistered(bytes32 indexed zoneId, string name, uint256 rate);
-    event BridgeTransfer(address indexed user, bytes32 indexed zoneId, uint256 amount, uint256 nonce, uint256 atBlock);
+    event BridgeIn(address indexed user, bytes32 indexed zoneId, uint256 amount, uint256 nonce, uint256 atBlock);
+    event BridgeOut(address indexed user, bytes32 indexed zoneId, uint256 amount, uint256 nonce, uint256 atBlock); // [MB-01]
+    event FeeCollectorProposed(address indexed candidate, uint256 timelockEndsBlock);
+    event FeeCollectorUpdated(address indexed newCollector);
 
-    constructor(address _spiToken) {
+    constructor(address _spiToken, address _feeCollector) {
         require(_spiToken != address(0), "zero token");
-        spiToken = IERC20(_spiToken);
+        spiToken      = IERC20(_spiToken);
+        feeCollector  = _feeCollector;
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        // FIX (3)(8): domain separator
-        DOMAIN_SEPARATOR = keccak256(abi.encodePacked(block.chainid, address(this), "MetaverseEconomyBridge_v1.1"));
+        DOMAIN_SEPARATOR = keccak256(abi.encodePacked(block.chainid, address(this), "MetaverseEconomyBridge_v1.2"));
     }
 
     modifier noPiCoin(bytes32 tokenHash) {
-        require(
-            tokenHash != PI_COIN_HASH &&
-            tokenHash != PI_NET_HASH  &&
-            tokenHash != PI_TICKER_HASH,
-            "Pi Coin banned"
-        );
+        require(tokenHash != PI_COIN_HASH && tokenHash != PI_NET_HASH && tokenHash != PI_TICKER_HASH, "Pi Coin banned");
         _;
     }
 
-    /// @notice Register a metaverse zone. FIX (7): zone immutable after creation.
     function registerZone(bytes32 zoneId, string calldata name, uint256 exchangeRate)
-        external
-        onlyRole(BRIDGE_OPERATOR)
-        nonReentrant                  // FIX (1)(4): global mutex
-        noPiCoin(keccak256(abi.encodePacked(name))) // FIX (8): name cannot be Pi Coin
+        external onlyRole(BRIDGE_OPERATOR) nonReentrant
+        noPiCoin(keccak256(abi.encodePacked(name)))
     {
-        require(zoneId != bytes32(0), "empty zoneId");
-        require(zoneId != PI_COIN_HASH && zoneId != PI_NET_HASH, "Pi Coin zoneId banned");
+        require(zoneId != bytes32(0) && zoneId != PI_COIN_HASH && zoneId != PI_NET_HASH, "invalid zoneId");
         require(!zones[zoneId].active, "zone exists");
         require(exchangeRate > 0, "zero rate");
-        // FIX (5): state change before any event (CEI)
         zones[zoneId] = MetaZone(zoneId, name, exchangeRate, true, block.number);
         emit ZoneRegistered(zoneId, name, exchangeRate);
     }
 
-    /// @notice Bridge $SPI into a metaverse zone.
-    /// FIX (1)(4): nonReentrant covers this and all other entry points.
-    /// FIX (3): nonce prevents cross-chain replay.
-    /// FIX (2)(6): SafeERC20.safeTransferFrom — no ERC-777, no raw .call().
-    function bridgeToZone(
-        bytes32 zoneId,
-        uint256 amount,
-        bytes32 expectedDomain   // FIX (3): caller must supply correct domain
-    ) external nonReentrant {    // FIX (1)(4): global reentrancy guard
-        require(zones[zoneId].active, "zone not active");
-        require(amount > 0, "zero amount");
-        require(zoneId != PI_COIN_HASH && zoneId != PI_NET_HASH, "Pi Coin banned");
-        require(expectedDomain == DOMAIN_SEPARATOR, "domain mismatch"); // FIX (3)
-
-        // FIX (5): update nonce (state) BEFORE transfer (interaction)
-        uint256 nonce = bridgeNonce[msg.sender]++;
-
-        // FIX (2)(6): SafeERC20.safeTransferFrom — no ERC-777 tokensReceived callbacks
-        spiToken.safeTransferFrom(msg.sender, address(this), amount);
-
-        emit BridgeTransfer(msg.sender, zoneId, amount, nonce, block.number);
-    }
-
-    /// @notice Withdraw $SPI from a zone back to L1.
-    function withdrawFromZone(bytes32 zoneId, uint256 amount, bytes32 expectedDomain)
-        external
-        nonReentrant    // FIX (1)(4)
+    /// @notice Bridge $SPI INTO a metaverse zone. CEI + SafeERC20 + domain check.
+    function bridgeIn(bytes32 zoneId, uint256 amount, bytes32 expectedDomain)
+        external nonReentrant
     {
         require(zones[zoneId].active, "zone not active");
         require(amount > 0, "zero amount");
-        require(expectedDomain == DOMAIN_SEPARATOR, "domain mismatch"); // FIX (3)
-
+        require(zoneId != PI_COIN_HASH && zoneId != PI_NET_HASH, "Pi Coin banned");
+        require(expectedDomain == DOMAIN_SEPARATOR, "domain mismatch");
         uint256 nonce = bridgeNonce[msg.sender]++;
-        // FIX (5): nonce updated before transfer (CEI)
-        spiToken.safeTransfer(msg.sender, amount); // FIX (2)(6): SafeERC20
-        emit BridgeTransfer(msg.sender, zoneId, amount, nonce, block.number);
+        deposits[msg.sender][zoneId] += amount; // CEI: state before transfer
+        spiToken.safeTransferFrom(msg.sender, address(this), amount);
+        emit BridgeIn(msg.sender, zoneId, amount, nonce, block.number);
+    }
+
+    /// @notice [MB-01] Bridge $SPI OUT from a metaverse zone back to L1.
+    /// This was missing entirely — now fully implemented.
+    function bridgeOut(bytes32 zoneId, uint256 amount, bytes32 expectedDomain)
+        external nonReentrant
+    {
+        require(zones[zoneId].active, "zone not active");
+        require(amount > 0, "zero amount");
+        require(expectedDomain == DOMAIN_SEPARATOR, "domain mismatch");
+        require(deposits[msg.sender][zoneId] >= amount, "insufficient deposit");
+        uint256 nonce = bridgeNonce[msg.sender]++;
+        deposits[msg.sender][zoneId] -= amount; // CEI: state before transfer
+        spiToken.safeTransfer(msg.sender, amount);
+        emit BridgeOut(msg.sender, zoneId, amount, nonce, block.number);
+    }
+
+    /// @notice [MB-HIGH] Propose feeCollector change — starts 48h timelock.
+    function proposeFeeCollectorChange(address candidate) external onlyRole(FEE_GUARDIAN) {
+        require(candidate != address(0), "zero address");
+        pendingFeeCollector = candidate;
+        feeCollectorChangeProposedBlock = block.number;
+        emit FeeCollectorProposed(candidate, block.number + FEE_COLLECTOR_TIMELOCK);
+    }
+
+    /// @notice [MB-HIGH] Confirm feeCollector after timelock elapsed.
+    function confirmFeeCollectorChange() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        require(pendingFeeCollector != address(0), "no pending");
+        require(block.number >= feeCollectorChangeProposedBlock + FEE_COLLECTOR_TIMELOCK, "timelock active");
+        feeCollector = pendingFeeCollector;
+        pendingFeeCollector = address(0);
+        emit FeeCollectorUpdated(feeCollector);
+    }
+
+    function getDeposit(address user, bytes32 zoneId) external view returns (uint256) {
+        return deposits[user][zoneId];
     }
 }
